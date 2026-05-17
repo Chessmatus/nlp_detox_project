@@ -1,0 +1,362 @@
+\documentclass{article}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Multilingual Text Detoxification with mT0 Candidates and Reference-Free Reranking\\\large Project Report}
+\author{Altay Eynullaev and Denis Rubtsov}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report describes our solution for the PAN 2025 Multilingual Text Detoxification task. The task is to rewrite a toxic input sentence into a non-toxic sentence in the same language while preserving the original meaning and producing fluent text. It covers 15 languages and is evaluated by a combination of style transfer accuracy, semantic content preservation, and fluency. We build a small heterogeneous candidate set consisting of four systems: the duplicate baseline, the lexicon-based delete baseline, an mT0 direct generation mode, and an mT0 generation mode with an explicit \texttt{Detoxify:} prefix. We then choose the final output using a reference-free reranking score based on non-toxicity, LaBSE semantic similarity, length-based adequacy, toxic-lexicon penalties, and checks for broken generations. This simple ensemble improves substantially over the single mT0 direct submission: our best submitted AvgP score is 0.697, which is higher than the 0.6852 automatic AvgP score reported for the winning \textit{ducanhhbtt} system in the PAN 2025 overview paper.
+\end{abstract}
+
+\section{Introduction}
+
+Online discussions often contain abusive, obscene, or otherwise toxic language. A common moderation strategy is to detect and block such content. However, blocking alone does not help users express the same underlying message in a less harmful form. Text detoxification addresses this limitation by treating moderation as a rewriting problem: given a toxic text, the system should produce a non-toxic paraphrase that preserves as much meaning as possible.
+
+The PAN 2025 Multilingual Text Detoxification task formulates this problem in a multilingual setting. The input is a toxic sentence in one of 15 languages, and the output must be a detoxified sentence in the same language. The official task description emphasizes three quality dimensions: the rewritten text should be non-toxic, semantically close to the original, and fluent \cite{pan25taskpage,dementieva2025pantextdetox}. This combination makes the task more difficult than simple profanity removal. Removing all offensive words can improve toxicity scores, but it can also destroy meaning or create ungrammatical fragments. Conversely, preserving meaning too literally may leave toxic language unchanged.
+
+Our project follows a lightweight generation-and-selection strategy. We use the released mT0-based detoxification model as the main neural generator because it is a strong multilingual baseline from the TextDetox shared tasks. We also keep two simple baselines, duplicate and delete, as candidates rather than only as evaluation baselines. The final output is selected by a reranker that approximates the official metric without access to hidden human references. This design does not require fine-tuning a large model, but still exploits the fact that different candidate systems make different kinds of errors.
+
+\subsection{Team contribution}
+Denis Rubtsov suggested the task, prepared the notebook with implemented baselines, ran the CodaBench submissions, and wrote the larger part of the initial report draft. Altay Eynullaev suggested the reranking idea based on the literature review, implemented and refined the reranking pipeline, and described the reranking approach in the report. Both team members participated in literature review, coding, debugging, and writing.
+
+\section{Literature Review}
+\label{sec:literature}
+
+\subsection{Text detoxification as text style transfer}
+
+Text detoxification is usually considered a special case of text style transfer, where the attribute to be changed is toxicity and the main semantic content should remain stable. In classical style transfer, a model may change sentiment, formality, politeness, or author style. In detoxification, the transformation is constrained by social and safety considerations: the output should not merely hide profanity, but should become acceptable while retaining the user's communicative intent.
+
+Early detoxification datasets and systems were mostly monolingual. ParaDetox introduced a parallel English dataset of toxic and neutral paraphrases and showed that supervised sequence-to-sequence models can learn this rewriting task when parallel data is available \cite{logacheva2022paradetox}. Later work extended detoxification to multilingual settings. MultiParaDetox expanded parallel detoxification resources beyond a single language and made cross-lingual transfer more central \cite{dementieva2024multiparadetox}. The PAN 2024 and PAN 2025 shared tasks continued this line by providing multilingual evaluation settings, data, and baselines \cite{dementieva2024pantextdetox,dementieva2025pantextdetox}.
+
+A useful distinction in this literature is between supervised and unsupervised approaches. Supervised methods fine-tune a generation model on toxic-neutral pairs. They usually perform well when enough high-quality parallel data exists, but require annotation and may generalize poorly to languages or toxicity types not seen during training. Unsupervised and weakly supervised methods include deletion of toxic spans, backtranslation through a language with a stronger detoxification model, and prompting general-purpose large language models. These methods are easier to apply to new languages, but they often trade off toxicity removal against semantic preservation and fluency.
+
+\subsection{Known baselines: duplicate, delete, backtranslation, mT0, and prompting}
+
+The PAN 2025 task provides several baseline families: duplicate input, rule-based deletion, backtranslation, fine-tuned mT0, and LLM prompting \cite{pan25taskpage,dementieva2025pantextdetox}. The duplicate baseline simply copies the input. It preserves content and fluency but fails to remove toxicity. The delete baseline removes toxic keywords using language-specific lexicons. It can reduce explicit toxicity, but it may also damage grammar and meaning because deletion is not the same as paraphrasing. Backtranslation translates non-English inputs into English, detoxifies them with an English model, and translates them back. This can support cross-lingual transfer, but translation errors and meaning drift are possible. LLM prompting is flexible, yet its performance depends strongly on prompt design, language coverage, cost, and stability.
+
+The mT0 family is especially relevant for our project. mT0 models are multilingual instruction-tuned sequence-to-sequence models derived from mT5 and trained to follow natural-language prompts across many tasks and languages \cite{xue2021mt5,muennighoff2023mt0}. In the TextDetox setting, mT0-XL-Detox-ORPO was one of the strong systems from the 2024 shared task and was reused as a major baseline in PAN 2025 \cite{dementieva2025pantextdetox}. The PAN 2025 overview reports that mT0 remains a strong baseline for the nine languages with parallel training data and still gives non-trivial zero-shot performance for several new languages, although its performance decreases for languages absent from its detoxification fine-tuning data \cite{dementieva2025pantextdetox}.
+
+This motivates using mT0 as a generator rather than training a new model from scratch. For a course project, such a choice has three advantages. First, the baseline is directly aligned with the shared task. Second, it is multilingual and therefore avoids designing separate models for each language. Third, it allows us to focus on selection and evaluation, which are central to this task because the official score is a product of several competing objectives.
+
+\subsection{Reranking and candidate selection}
+
+Many generation tasks benefit from producing multiple candidates and selecting one with an external score. This idea is common in machine translation, summarization, and dialogue generation, where the model's highest-probability output is not always the best output under the task metric. Classical discriminative reranking in machine translation used additional features to reorder hypotheses from a first-pass decoder \cite{shen2004reranking}. Modern generation systems often use learned metrics, quality estimation models, toxicity classifiers, semantic similarity models, or task-specific reward functions to select among candidate outputs.
+
+Text detoxification is a natural setting for reranking. A candidate that is very safe may delete too much content. A candidate that preserves content may keep toxic wording. A candidate that looks fluent may be insufficiently detoxified. Therefore, a single generation likelihood is not enough: we want a selection rule that explicitly balances toxicity reduction, content similarity, and fluency. This is also how the PAN 2025 automatic evaluation is structured. The official metric combines style transfer accuracy, semantic similarity, and fluency into a joint score, with all components in the interval $[0,1]$ \cite{pan25taskpage,dementieva2025pantextdetox}.
+
+Our approach follows this principle but uses a pragmatic reference-free approximation. Unlike the official hidden evaluation, our reranker cannot use the human detoxification reference. It therefore combines a multilingual toxicity classifier, LaBSE input-output similarity, length and formatting checks, and a lexicon penalty. The final system is best understood as a small candidate ensemble with a metric-inspired selector.
+
+\subsection{Evaluation models}
+
+The official PAN 2025 evaluation uses three components. Style transfer accuracy is based on a multilingual toxicity classifier. Content preservation is measured with cosine similarity between LaBSE embeddings, with the 2025 version also incorporating reference detoxifications when they are available. Fluency is estimated with xCOMET, a learned metric originally designed for machine translation evaluation \cite{conneau2020xlmr,feng2022labse,guerreiro2023xcomet}. These metrics are not perfect proxies for human judgment, but they are useful for automatic leaderboard evaluation and for designing reranking strategies.
+
+For our system, the most important observation is that the official score is multiplicative. A very low score in any component can make the final score low even if the other components are high. Therefore, reranking should avoid candidates that over-optimize only one dimension. In practice, our reranker rejects outputs that are empty, outputs that copy the toxic input too closely, outputs that contain prompt leakage, and outputs that are much shorter or longer than the source.
+
+\section{Problem Formulation and Dataset Description}
+\label{sec:problem_dataset}
+
+\subsection{Task definition}
+
+For each example, we are given a toxic sentence $s_i$ and its language label $\ell_i$. The goal is to generate a sentence $g_i$ such that:
+\begin{enumerate}[noitemsep]
+    \item $g_i$ is written in the same language $\ell_i$ as $s_i$;
+    \item $g_i$ is less toxic than $s_i$;
+    \item $g_i$ preserves the main content of $s_i$;
+    \item $g_i$ is fluent and natural.
+\end{enumerate}
+
+The task deliberately focuses on explicit toxicity, such as obscene or rude lexical items, where a neutral paraphrase can still preserve meaningful content. Cases where the full meaning is inseparable from hate, harassment, sarcasm, or implicit aggression are more difficult and are not the main target of the shared task \cite{pan25taskpage,dementieva2025pantextdetox}.
+
+\subsection{Languages and data splits}
+
+The task covers 15 languages. Nine languages have parallel training data: English, Spanish, German, Chinese, Arabic, Hindi, Ukrainian, Russian, and Amharic. Six additional languages are used to test cross-lingual transfer: Italian, French, Hebrew, Hinglish, Japanese, and Tatar. The task page describes 400 parallel toxic-neutral pairs for each of the nine training languages and test data for all languages \cite{pan25taskpage}. The PAN 2025 overview further describes the construction of new language datasets and the annotation process for the additional languages \cite{dementieva2025pantextdetox}.
+
+\begin{table}[tbh!]
+\centering
+\begin{tabular}{p{0.24\linewidth}p{0.63\linewidth}}
+\toprule
+Group & Languages \\
+\midrule
+Languages with parallel training data & English, Spanish, German, Chinese, Arabic, Hindi, Ukrainian, Russian, Amharic \\
+Languages without parallel training data in the original setup & Italian, French, Hebrew, Hinglish, Japanese, Tatar \\
+\bottomrule
+\end{tabular}
+\caption{Language groups in the PAN 2025 Multilingual Text Detoxification task.}
+\label{tab:languages}
+\end{table}
+
+The input and output format is sentence-level. The final submission is a TSV file in a zip archive. In our actual CodaBench input file, the columns were \texttt{toxic\_sentence}, \texttt{neutral\_sentence}, and \texttt{lang}. We preserved the original \texttt{toxic\_sentence} and \texttt{lang} columns exactly and changed only \texttt{neutral\_sentence}. This was important because even small changes in the source column can break the evaluator's row matching.
+
+\subsection{Examples}
+
+Table~\ref{tab:examples} shows simplified English examples from the task description. They illustrate that detoxification is not identical to deletion: the system may need to replace an offensive expression with a neutral paraphrase.
+
+\begin{table}[tbh!]
+\centering
+\begin{tabular}{p{0.43\linewidth}p{0.43\linewidth}}
+\toprule
+Toxic input & Detoxified output \\
+\midrule
+he had steel b*lls too! & he was brave too! \\
+delete the page and sh*t up & delete the page \\
+what a chicken cr*p excuse for a reason. & what a bad excuse for a reason. \\
+\bottomrule
+\end{tabular}
+\caption{Examples of English text detoxification from the task description.}
+\label{tab:examples}
+\end{table}
+
+\subsection{Evaluation metric}
+
+The official evaluation is based on three components:
+\begin{itemize}[noitemsep]
+    \item \textbf{Style transfer accuracy (STA):} the output should be classified as non-toxic or less toxic than the input/reference comparison requires.
+    \item \textbf{Content preservation (SIM):} the output should remain semantically close to the source and, in the reference-aware evaluation, also close to the human detoxification.
+    \item \textbf{Fluency (FL):} the output should be grammatical, natural, and similar to a human-written detoxification.
+\end{itemize}
+
+A simplified form of the joint score is
+\begin{equation}
+J = \frac{1}{n}\sum_{i=1}^{n} \mathrm{STA}(s_i,g_i,r_i) \cdot \mathrm{SIM}(s_i,g_i,r_i) \cdot \mathrm{FL}(s_i,g_i,r_i),
+\label{eq:joint}
+\end{equation}
+where $s_i$ is the toxic source sentence, $g_i$ is the generated detoxification, and $r_i$ is the human reference when it is available. In the hidden test setting, references are not available to participants. This is why our practical reranker uses a reference-free approximation.
+
+\section{Our Approach}
+\label{sec:approach}
+
+\subsection{Overview}
+
+We propose a best-of-four setup among heterogeneous candidate set:
+\begin{enumerate}[noitemsep]
+    \item \textbf{Duplicate}: copy the toxic input.
+    \item \textbf{Delete}: remove detected toxic lexicon terms from the input.
+    \item \textbf{mT0-direct}: pass the raw input sentence directly to \texttt{s-nlp/mt0-xl-detox-orpo}.
+    \item \textbf{mT0-detoxify}: pass the prefixed input \texttt{Detoxify: <sentence>} to the same mT0 model.
+\end{enumerate}
+
+The final answer is selected by a reranker. Thus, our final method is a four-candidate ensemble that combines trivial preservation, rule-based toxicity removal, and two mT0 prompting modes.
+
+\begin{table}[tbh!]
+\centering
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+Candidate & Construction & Typical role in the ensemble \\
+\midrule
+Duplicate & $g=s$ & Content-preserving fallback; usually toxic and therefore rarely selected by the final reranker. \\
+Delete & Remove lexicon-matched toxic substrings & Useful when toxicity is explicit and local; may harm grammar or content. \\
+mT0-direct & Raw sentence as input to mT0 detox model & Main neural candidate; often produces the best balance of meaning and detoxification. \\
+mT0-detoxify & \texttt{Detoxify:} prefix before the sentence & Explicit task framing; sometimes removes toxicity missed by direct mode, but can behave differently because the prefix changes the seq2seq input distribution. \\
+\bottomrule
+\end{tabular}
+\caption{The four candidates used by the implemented system.}
+\label{tab:candidates}
+\end{table}
+
+\subsection{Difference between mT0-direct and mT0-detoxify}
+
+Both neural candidates use the same checkpoint, \texttt{s-nlp/mt0-xl-detox-orpo}. The difference is the input format.
+
+In \textbf{mT0-direct}, the model receives only the toxic sentence. This is suitable because the checkpoint is already fine-tuned for detoxification; the raw input resembles the expected source side of a sequence-to-sequence detoxification task. In our debugging, direct input avoided instruction leakage and produced fluent outputs for many languages.
+
+In \textbf{mT0-detoxify}, the model receives a short task prefix:
+\begin{quote}
+\texttt{Detoxify: <sentence>}
+\end{quote}
+This prefix explicitly tells the model the desired transformation. It is much shorter than the long natural-language instruction used in an earlier attempt. The long instruction was rejected because it sometimes caused the model to copy part of the instruction itself. The short prefix provides a different candidate without changing the model weights. In practice, direct and detoxify modes often produce similar but not identical outputs; this difference is exactly what makes reranking useful.
+
+\subsection{Rule-based delete candidate}
+
+The delete candidate uses a multilingual toxic lexicon. For each input sentence, we search for toxic substrings in the lexicon of the corresponding language and replace detected terms with spaces. We then normalize whitespace and punctuation. If the resulting output is empty, we fall back to the source sentence. This baseline is weak as a final system, but it is valuable as a candidate because it can remove obvious profanity when the neural model leaves it unchanged.
+
+\subsection{Reference-free heuristic reranking}
+
+The submitted reranker is a reference-free heuristic approximation of Equation~\ref{eq:joint}. It does not use human references and it does not use xCOMET directly. Instead, it scores each candidate with accessible signals:
+\begin{equation}
+R(s,g,\ell) = w_{\mathrm{tox}} A(g,\ell) + w_{\mathrm{sim}} S(s,g) + w_{\mathrm{len}} L(s,g) - \Pi(s,g,\ell),
+\label{eq:heuristic}
+\end{equation}
+where $A$ is a non-toxicity score, $S$ is LaBSE similarity, $L$ is a length-based adequacy score, and $\Pi$ is a penalty term.
+
+The components are:
+\begin{itemize}
+    \item \textbf{Non-toxicity score}: probability that the candidate is non-toxic according to a multilingual toxicity classifier. This approximates STA.
+    \item \textbf{Semantic similarity}: cosine similarity between LaBSE embeddings of the source and the candidate. This approximates content preservation.
+    \item \textbf{Length adequacy}: a smooth score based on the output/source length ratio. Very short outputs are penalized because they often delete content; very long outputs are suspicious because they may contain explanations or prompt leakage.
+    \item \textbf{Lexicon penalty}: candidates that still contain detected toxic terms are penalized.
+    \item \textbf{Safety flags}: prompt leakage, empty strings, unchanged toxic inputs, and extreme length mismatch receive additional penalties.
+\end{itemize}
+
+The reranker then selects
+\begin{equation}
+\hat{g}_i = \arg\max_{g \in C_i} R(s_i,g,\ell_i),
+\end{equation}
+where $C_i$ contains the four candidates in Table~\ref{tab:candidates}. This is not a learned reranker: all weights and penalties are fixed heuristics chosen to reflect the official metric's structure and to avoid obvious failure modes.
+
+
+\subsection{Official-metric-inspired reranking variant}
+
+In addition to the submitted heuristic reranker, we tested a second non-learned selection rule that follows the scoring idea used in the GemDetox paper more directly. GemDetox reports inference-time candidate selection by evaluating several generated rewrites with a joint quality score based on style transfer accuracy, LaBSE semantic preservation, and xCOMET fluency \cite{dang2025gemdetox}. We adapted this idea to our four-candidate setup.
+
+For each input $s_i$ and each candidate $g \in C_i$, we computed
+\begin{equation}
+J_{\mathrm{proxy}}(s_i,g)=\mathrm{SIM}(s_i,g)\cdot \mathrm{STA}(s_i,g)\cdot \mathrm{XCOMET}(s_i,g,g),
+\label{eq:metricrerank}
+\end{equation}
+where $\mathrm{SIM}$ is the LaBSE similarity between the input and the candidate, $\mathrm{STA}$ is the toxicity-reduction/style-transfer score from the official evaluation code, and $\mathrm{XCOMET}$ is the fluency score computed by passing the candidate itself as the reference. The last choice is an approximation: the official hidden evaluation uses human references, but these references are not available at test time. We also kept the same deterministic safety penalties as in the heuristic reranker for broken generations, excessive shortening, excessive lengthening, unchanged toxic inputs, and remaining lexicon-matched toxic terms.
+
+This variant is therefore closer to the official metric implementation than the submitted heuristic reranker because it uses xCOMET instead of a length-only fluency proxy. However, it is still reference-free and cannot reproduce the full official metric exactly. In our experiments, this official-metric-inspired reranker obtained AvgP $=0.6821$. This was better than the single mT0-direct run, but worse than the simpler heuristic reranker. We interpret this as evidence that xCOMET with the candidate used as its own reference is not always aligned with the hidden reference-aware evaluation.
+
+\subsection{Why this combination works}
+
+The four candidates make complementary errors. Duplicate has maximum content preservation but usually fails detoxification. Delete strongly attacks explicit toxicity but can damage meaning. mT0-direct is the strongest general-purpose candidate, but it sometimes under-detoxifies or misses slang. mT0-detoxify changes the prompt distribution and sometimes produces a better rewrite for the same input. The reranker improves performance by selecting delete or detoxify only when they appear clearly safer without losing too much similarity, while keeping mT0-direct for many regular cases.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Implementation details}
+
+We used the official test input file and preserved the source columns exactly in all submissions. This required a separate internal representation: internally we used normalized columns \texttt{toxic\_text}, \texttt{neutral\_text}, and \texttt{lang}, but the final CodaBench submission restored the original column names and changed only the neutral output column.
+
+The mT0 model was run on a T4 GPU. We initially observed extremely slow inference because the model was not fully placed on CUDA. After forcing proper GPU usage, generating all 9000 test outputs for one mT0 variant took about one hour. We used fast greedy decoding with a moderate maximum output length. Long natural-language prompts were abandoned after manual debugging showed instruction leakage.
+
+\subsection{Systems compared}
+
+We evaluated or used the following systems:
+\begin{itemize}[noitemsep]
+    \item \textbf{Duplicate}: copy the input.
+    \item \textbf{Delete}: lexicon-based deletion.
+    \item \textbf{mT0-direct}: raw-input mT0 generation.
+    \item \textbf{mT0-detoxify}: mT0 generation with the \texttt{Detoxify:} prefix.
+    \item \textbf{Official-metric-inspired reranking}: a four-candidate selector using $J_{\mathrm{proxy}}=\mathrm{SIM}\times\mathrm{STA}\times\mathrm{XCOMET}$ with no hidden references.
+    \item \textbf{Heuristic reranking}: our final submitted four-candidate ensemble.
+\end{itemize}
+
+\section{Results}
+\label{sec:results}
+
+Table~\ref{tab:results} summarizes the main submitted results available at the time of writing. The most important comparison is between the single neural baseline and our reranked ensemble. The direct mT0 submission obtained AvgP $=0.6555$, while the final heuristic reranking submission obtained AvgP $=0.697$.
+
+\begin{table}[tbh!]
+\centering
+\begin{tabular}{lcl}
+\toprule
+System & AvgP \\
+\midrule
+Duplicate & 0.4752  \\
+Delete & 0.4332\\
+mT0-direct & 0.6555 \\
+mT0-detoxify & 0.6693 \\
+Official-metric-inspired reranking & 0.6821 \\
+Four-candidate heuristic reranking & \textbf{0.6970} \\
+mT0 baseline & 0.6750  \\
+PAN 2025 winner& 0.6852  \\
+\bottomrule
+\end{tabular}
+\caption{Main results on the AvgP automatic leaderboard. Dashes indicate candidates used inside the ensemble but not used as the final reported standalone submission.}
+\label{tab:results}
+\end{table}
+
+The final result improves over our single mT0-direct run by $0.0415$ absolute AvgP points. It also exceeds the published automatic AvgP score of the \textit{ducanhhbtt} system reported in the PAN 2025 overview paper ($0.6970$ vs. $0.6852$). This comparison should be interpreted specifically for the automatic AvgP leaderboard setting. It should not be mixed with the later LLM-as-a-Judge leaderboard, which uses a different evaluation protocol and produces different absolute values.
+
+The improvement suggests that even a simple non-learned candidate selector can be effective when the candidates are complementary. The result also confirms that delete and duplicate baselines, although weak as standalone systems, can still be useful in a reranking ensemble: duplicate acts as a content-preserving fallback, and delete occasionally repairs explicit profanity left by the neural model.
+
+\section{Discussion}
+
+The most useful practical lesson was that prompt design for a fine-tuned seq2seq model differs from prompt design for chat LLMs. A long natural-language prompt looked reasonable but caused instruction leakage in several examples. Shorter prompts and direct inputs were more stable. This is why our final neural candidates are \texttt{direct} and \texttt{Detoxify:}, not several long prompt variants.
+
+A second lesson is that official metric structure can guide engineering even without full access to hidden references. The reranker does not know the human reference, but it can still approximate the three main dimensions: non-toxicity, similarity, and fluency/adequacy. The multiplicative nature of the official metric also motivates conservative penalties: an output that is empty, too short, prompt-like, or still toxic should be avoided even if one component looks good.
+
+The main limitation is that the heuristic reranker is not a true optimization of the official score. LaBSE similarity to the source can reward copying toxic phrasing. The toxicity classifier may be less reliable for low-resource languages and slang. The length proxy is only a rough substitute for fluency. Our official-metric-inspired reranking experiment partly addressed the fluency issue by using xCOMET, but it still lacked human references and therefore did not outperform the simpler heuristic selector. A future version could tune reranking weights on a held-out development set with references or use learned preference models calibrated to human judgments.
+
+\section{Conclusion}
+
+This report presented a practical multilingual text detoxification system based on candidate generation and reference-free reranking. We combine four candidates: duplicate, delete, mT0-direct, and mT0-detoxify. A heuristic reranker then selects the best candidate using non-toxicity, semantic similarity, length adequacy, lexicon penalties, and safety checks. This approach improved the AvgP score from 0.6555 for a single mT0-direct run to 0.697 for the final ensemble. It also exceeded the 0.6852 automatic AvgP result reported for the published \textit{ducanhhbtt} system in the PAN 2025 overview paper. The method is simple, reproducible, and does not require fine-tuning a large model, making it suitable for a course project and for rapid experimentation.
+
+\begin{thebibliography}{99}
+
+\bibitem[Dementieva et~al., 2025]{dementieva2025pantextdetox}
+Dementieva, D., Protasov, V., Babakov, N., Rizwan, N., Alimova, I., Brun, C., Konovalov, V., Muti, A., Liebeskind, C., Litvak, M., Nozza, D., Khan, S. S., Takeshita, S., Vanetik, N., Ayele, A. A., Schneider, F., Wang, X., Yimam, S. M., Elnagar, A., Mukherjee, A., and Panchenko, A. (2025).
+\newblock Overview of the Multilingual Text Detoxification Task at PAN 2025.
+\newblock In \emph{CLEF 2025 Working Notes}.
+
+\bibitem[Dementieva et~al., 2024a]{dementieva2024pantextdetox}
+Dementieva, D., Moskovskiy, D., Babakov, N., Ayele, A. A., Rizwan, N., Schneider, F., Wang, X., Yimam, S. M., Ustalov, D., Stakovskii, E., Smirnova, A., Elnagar, A., Mukherjee, A., and Panchenko, A. (2024).
+\newblock Overview of the Multilingual Text Detoxification Task at PAN 2024.
+\newblock In \emph{CLEF 2024 Working Notes}.
+
+\bibitem[Dementieva et~al., 2024b]{dementieva2024multiparadetox}
+Dementieva, D., Babakov, N., and Panchenko, A. (2024).
+\newblock MultiParaDetox: Extending Text Detoxification with Parallel Data to New Languages.
+\newblock In \emph{Proceedings of NAACL 2024}.
+
+\bibitem[Feng et~al., 2022]{feng2022labse}
+Feng, F., Yang, Y., Cer, D., Arivazhagan, N., and Wang, W. (2022).
+\newblock Language-agnostic BERT Sentence Embedding.
+\newblock In \emph{Proceedings of ACL}.
+
+\bibitem[Guerreiro et~al., 2023]{guerreiro2023xcomet}
+Guerreiro, N. M., Rei, R., van Stigt, D., Coheur, L., Colombo, P., and Martins, A. F. T. (2023).
+\newblock xCOMET: Transparent Machine Translation Evaluation through Fine-grained Error Detection.
+\newblock arXiv preprint arXiv:2310.10482.
+
+\bibitem[Conneau et~al., 2020]{conneau2020xlmr}
+Conneau, A., Khandelwal, K., Goyal, N., Chaudhary, V., Wenzek, G., Guzman, F., Grave, E., Ott, M., Zettlemoyer, L., and Stoyanov, V. (2020).
+\newblock Unsupervised Cross-lingual Representation Learning at Scale.
+\newblock In \emph{Proceedings of ACL}.
+
+\bibitem[Logacheva et~al., 2022]{logacheva2022paradetox}
+Logacheva, V., Dementieva, D., Ustyantsev, S., Moskovskiy, D., Dale, D., Krotova, I., Semenov, N., and Panchenko, A. (2022).
+\newblock ParaDetox: Detoxification with Parallel Data.
+\newblock In \emph{Proceedings of ACL}.
+
+\bibitem[Muennighoff et~al., 2023]{muennighoff2023mt0}
+Muennighoff, N., Wang, T., Sutawika, L., Roberts, A., Biderman, S., Scao, T. L., Bari, M. S., Shen, S., Yong, Z.-X., Schoelkopf, H., et~al. (2023).
+\newblock Crosslingual Generalization through Multitask Finetuning.
+\newblock In \emph{Proceedings of ACL}.
+
+\bibitem[PAN, 2025]{pan25taskpage}
+PAN. (2025).
+\newblock Multilingual Text Detoxification 2025 Task Page.
+\newblock \url{https://pan.webis.de/clef25/pan25-web/text-detoxification.html}.
+
+\bibitem[Shen et~al., 2004]{shen2004reranking}
+Shen, L., Sarkar, A., and Och, F. J. (2004).
+\newblock Discriminative Reranking for Machine Translation.
+\newblock In \emph{Proceedings of HLT-NAACL}.
+
+\bibitem[Xue et~al., 2021]{xue2021mt5}
+Xue, L., Constant, N., Roberts, A., Kale, M., Al-Rfou, R., Siddhant, A., Barua, A., and Raffel, C. (2021).
+\newblock mT5: A Massively Multilingual Pre-trained Text-to-Text Transformer.
+\newblock In \emph{Proceedings of NAACL}.
+
+\bibitem[Dang and D'Elia, 2025]{dang2025gemdetox}
+Dang, T. D. A. and D'Elia, F. P. (2025).
+\newblock {GemDetox}: Enhancing a Massively Multilingual Model for Text Detoxification on Low-Resource Languages.
+\newblock In \emph{Working Notes of CLEF 2025 -- Conference and Labs of the Evaluation Forum}. CEUR-WS.org.
+
+
+
+\end{thebibliography}
+
+\end{document}
