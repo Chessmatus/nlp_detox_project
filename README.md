@@ -1,6 +1,6 @@
 # NlpDetoxProject
 
-This repository is a project that we had to do during NLP course of 10th semester at MIPT. 
+This repository is a project that we had to do during NLP course of 10th semester at the MIPT. 
 
 ## Code
 
